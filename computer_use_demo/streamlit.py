@@ -21,6 +21,12 @@ from anthropic.types.beta import (
     BetaTextBlockParam,
 )
 from streamlit.delta_generator import DeltaGenerator
+from fastapi import FastAPI
+from fastapi.middleware.wsgi import WSGIMiddleware
+import uvicorn
+from threading import Thread
+from computer_use_demo.shared import message_queue, responses, response_ready  # Add responses here
+
 
 from computer_use_demo.loop import (
     PROVIDER_TO_DEFAULT_MODEL_NAME,
@@ -46,7 +52,6 @@ STREAMLIT_STYLE = """
 """
 
 WARNING_TEXT = "⚠️ Security Alert: Never provide access to sensitive accounts or data, as malicious web content can hijack Claude's behavior"
-
 
 class Sender(StrEnum):
     USER = "user"
@@ -93,6 +98,17 @@ def _reset_model():
 async def main():
     """Render loop for streamlit"""
     setup_state()
+
+    if "api_message_queue" not in st.session_state:
+        st.session_state.api_message_queue = []
+
+    # Check for messages from the API
+    try:
+        while not message_queue.empty():
+            message_id, new_message = message_queue.get_nowait()
+            st.session_state.api_message_queue.append((message_id, new_message))
+    except Exception as e:
+        st.error(f"Error processing API message: {str(e)}")
 
     st.markdown(STREAMLIT_STYLE, unsafe_allow_html=True)
 
@@ -163,71 +179,60 @@ async def main():
             st.session_state.auth_validated = True
 
     chat, http_logs = st.tabs(["Chat", "HTTP Exchange Logs"])
-    new_message = st.chat_input(
-        "Type a message to send to Claude to control the computer..."
-    )
+    # Handle the message
+    new_message = None
+    message_id = None
+    if st.session_state.api_message_queue:
+        message_id, new_message = st.session_state.api_message_queue.pop(0)
+    else:
+        new_message = st.chat_input("Type a message to send to Claude to control the computer...")
 
+    st.components.v1.html("""
+                    <script>
+                        window.parent.location.reload();
+                    </script>
+                """, height=0)
+    
     with chat:
-        # render past chats
-        for message in st.session_state.messages:
-            if isinstance(message["content"], str):
-                _render_message(message["role"], message["content"])
-            elif isinstance(message["content"], list):
-                for block in message["content"]:
-                    # the tool result we send back to the Anthropic API isn't sufficient to render all details,
-                    # so we store the tool use responses
-                    if isinstance(block, dict) and block["type"] == "tool_result":
-                        _render_message(
-                            Sender.TOOL, st.session_state.tools[block["tool_use_id"]]
-                        )
-                    else:
-                        _render_message(
-                            message["role"],
-                            cast(BetaContentBlockParam | ToolResult, block),
-                        )
-
-        # render past http exchanges
-        for identity, (request, response) in st.session_state.responses.items():
-            _render_api_response(request, response, identity, http_logs)
-
-        # render past chats
+        # When we have a new message, add it and process it
         if new_message:
-            st.session_state.messages.append(
-                {
-                    "role": Sender.USER,
-                    "content": [BetaTextBlockParam(type="text", text=new_message)],
-                }
-            )
+            # Add the message to the session state
+            st.session_state.messages.append({
+                "role": Sender.USER,
+                "content": [BetaTextBlockParam(type="text", text=new_message)],
+            })
             _render_message(Sender.USER, new_message)
 
-        try:
-            most_recent_message = st.session_state["messages"][-1]
-        except IndexError:
-            return
+            # Process the message immediately
+            with st.spinner("Running Agent..."):
 
-        if most_recent_message["role"] is not Sender.USER:
-            # we don't have a user message to respond to, exit early
-            return
+                st.session_state.messages = await sampling_loop(
+                    system_prompt_suffix=st.session_state.custom_system_prompt,
+                    model=st.session_state.model,
+                    provider=st.session_state.provider,
+                    messages=st.session_state.messages,
+                    output_callback=partial(_render_message, Sender.BOT),
+                    tool_output_callback=partial(
+                        _tool_output_callback, tool_state=st.session_state.tools
+                    ),
+                    api_response_callback=partial(
+                        _api_response_callback,
+                        tab=http_logs,
+                        response_state=st.session_state.responses,
+                    ),
+                    api_key=st.session_state.api_key,
+                    only_n_most_recent_images=st.session_state.only_n_most_recent_images,
+                )
 
-        with st.spinner("Running Agent..."):
-            # run the agent sampling loop with the newest message
-            st.session_state.messages = await sampling_loop(
-                system_prompt_suffix=st.session_state.custom_system_prompt,
-                model=st.session_state.model,
-                provider=st.session_state.provider,
-                messages=st.session_state.messages,
-                output_callback=partial(_render_message, Sender.BOT),
-                tool_output_callback=partial(
-                    _tool_output_callback, tool_state=st.session_state.tools
-                ),
-                api_response_callback=partial(
-                    _api_response_callback,
-                    tab=http_logs,
-                    response_state=st.session_state.responses,
-                ),
-                api_key=st.session_state.api_key,
-                only_n_most_recent_images=st.session_state.only_n_most_recent_images,
-            )
+                # Store response for API if this came from API
+                if message_id:
+                    try:
+                        latest_messages = st.session_state.messages[-2:]  # Get last 2 messages
+                        responses[message_id] = latest_messages  # Store response with message ID
+                    except Exception as e:
+                        st.error(f"Error sending response: {str(e)}")
+                
+                st.rerun()  # Rerun to update UI
 
 
 def validate_auth(provider: APIProvider, api_key: str | None):
@@ -379,6 +384,15 @@ def _render_message(
         else:
             st.markdown(message)
 
+def run_api():
+    from computer_use_demo.api import app
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 if __name__ == "__main__":
+    # Start API server in a separate thread
+    api_thread = Thread(target=run_api, daemon=True)
+    api_thread.start()
+    
+    # Run Streamlit
     asyncio.run(main())
